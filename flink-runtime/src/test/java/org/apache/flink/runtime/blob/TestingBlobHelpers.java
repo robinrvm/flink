@@ -207,6 +207,41 @@ public final class TestingBlobHelpers {
             applicationDir =
                     cache.getStorageLocation(applicationId, new PermanentBlobKey()).getParentFile();
         }
+        checkFileCountInApplicationDir(expectedCount, applicationDir);
+    }
+
+    /**
+     * Checks the number of files in the blob service for the given application, like {@link
+     * #checkFileCountForApplication(int, ApplicationID, PermanentBlobService)}, but without
+     * creating the application directory.
+     *
+     * <p>Use this while a cleanup task may concurrently delete the application directory: creating
+     * the directory at the same time can fail with a {@link
+     * java.nio.file.FileAlreadyExistsException}.
+     *
+     * @param expectedCount number of expected files in the blob service for the given application
+     * @param applicationId ID of an application
+     * @param blobService BLOB store to use
+     */
+    public static void checkFileCountForApplicationWithoutCreatingDirectory(
+            int expectedCount, ApplicationID applicationId, PermanentBlobService blobService)
+            throws IOException {
+
+        final File storageDir;
+        if (blobService instanceof BlobServer) {
+            storageDir = ((BlobServer) blobService).getStorageDir();
+        } else {
+            storageDir = ((PermanentBlobCache) blobService).getStorageDir();
+        }
+        final File applicationDir =
+                new File(
+                        BlobUtils.getStorageLocationPath(
+                                storageDir.getAbsolutePath(), applicationId));
+        checkFileCountInApplicationDir(expectedCount, applicationDir);
+    }
+
+    private static void checkFileCountInApplicationDir(int expectedCount, File applicationDir)
+            throws IOException {
         File[] blobsForApplication = applicationDir.listFiles();
         if (blobsForApplication == null) {
             if (expectedCount != 0) {

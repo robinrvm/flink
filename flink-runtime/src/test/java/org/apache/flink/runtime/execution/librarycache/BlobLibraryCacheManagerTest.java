@@ -52,6 +52,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.apache.flink.runtime.blob.TestingBlobHelpers.checkFileCountForApplication;
+import static org.apache.flink.runtime.blob.TestingBlobHelpers.checkFileCountForApplicationWithoutCreatingDirectory;
 import static org.apache.flink.runtime.blob.TestingBlobHelpers.checkFileCountForJob;
 import static org.apache.flink.runtime.blob.TestingBlobHelpers.checkFilesExist;
 import static org.hamcrest.Matchers.not;
@@ -945,7 +946,8 @@ public class BlobLibraryCacheManagerTest extends TestLogger {
 
         // the blob cache should no longer contain the files
         // this fails if we exited via a timeout
-        checkFileCountForApplication(0, applicationId, cache);
+        // the cleanup task may still be deleting the application directory, so do not create it
+        checkFileCountForApplicationWithoutCreatingDirectory(0, applicationId, cache);
     }
 
     private static final class TestingClassLoader extends URLClassLoader {
