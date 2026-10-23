@@ -36,7 +36,7 @@ jobs:
         variant: [before, after]
         shard: [1, 2, 3, 4, 5]
     env:
-      RUNS: 1
+      RUNS: 20
       TEST: 'BlobLibraryCacheManagerTest#testApplicationLevelJarSharing+testDifferentApplicationsNotSharing'
     steps:
       - uses: actions/checkout@v7
@@ -53,10 +53,15 @@ jobs:
         run: |
           failed=0
           for i in $(seq 1 "$RUNS"); do
+            rm -rf flink-runtime/target/surefire-reports
             if ./mvnw -B -q surefire:test -pl flink-runtime -Dtest="$TEST" -Djdk17 -Pjava17-target; then
-              echo "run $i: passed"
+              result=passed
             else
-              echo "run $i: FAILED"
+              result=FAILED
+            fi
+            # -q hides the test summary, so print it from the report
+            echo "run $i: $result | $(grep -h 'Tests run' flink-runtime/target/surefire-reports/*BlobLibraryCacheManagerTest.txt 2>/dev/null || echo 'no test report')"
+            if [ "$result" = FAILED ]; then
               failed=$((failed + 1))
               cp -r flink-runtime/target/surefire-reports "reports-run-$i"
             fi
