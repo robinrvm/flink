@@ -32,6 +32,10 @@ on:
         description: "The Java version to use."
         default: 17
         type: number
+      ref:
+        description: "The commit to check out (empty: the commit that triggered the workflow)."
+        default: ""
+        type: string
     secrets:
       s3_bucket:
         required: false
@@ -85,6 +89,7 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: "Initialize job"
@@ -147,6 +152,7 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github
@@ -222,6 +228,7 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github
@@ -372,6 +379,7 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github

@@ -13,8 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Temporary workflow (do not merge): runs the tests affected by FLINK-40886
-# repeatedly, before and after the fix.
+# Temporary workflow (do not merge): runs tests repeatedly, before and after the
+# FLINK-40886 fix.
+#
+# TEST set to some tests: the "loop" job runs them RUNS times in each of 5 shards per
+# commit. It mirrors the "Test" job of template.flink-ci.yml: same container, JDK setup,
+# non-root user, Maven wrapper options (tools/ci/maven-utils.sh) and build/test options
+# (tools/ci/test_controller.sh), but builds only flink-runtime and its dependencies and
+# does not use the CI watchdog.
+#
+# TEST set to '': the "full-ci" job runs the complete Flink CI (template.flink-ci.yml,
+# as called by ci.yml) CI_RUNS times per commit.
 
 name: "FLINK-40886 loop"
 
@@ -25,51 +34,154 @@ on:
 
 permissions: read-all
 
+env:
+  # Keep exactly one TEST line uncommented.
+  # The 2 tests that call verifyApplicationCleanup:
+  TEST: 'BlobLibraryCacheManagerTest#testApplicationLevelJarSharing+testDifferentApplicationsNotSharing'
+  # The whole BlobLibraryCacheManagerTest class:
+  # TEST: 'BlobLibraryCacheManagerTest'
+  # All classes that call the changed checkFileCountForApplication helper:
+  # TEST: 'BlobLibraryCacheManagerTest,BlobServerDeleteTest,BlobServerCleanupTest'
+  # All test classes named Blob*Test:
+  # TEST: 'Blob*Test'
+  # The complete Flink CI (all modules, E2E tests and the compile job):
+  # TEST: ''
+
+  # Runs per shard when TEST is set (5 shards per commit).
+  RUNS: 1
+  # Limit for each run when TEST is set: GHA_JOB_TIMEOUT of the CI test job in
+  # template.flink-ci.yml. RUNS x the time of one run has to fit into the 360 minutes of the job.
+  RUN_TIMEOUT_MINUTES: 240
+
+  # Complete Flink CI runs per commit when TEST is ''. One run took 2h13m and 13 jobs
+  # (557 job minutes); GitHub runs at most 20 jobs at once, so more runs queue up.
+  CI_RUNS: 1
+
+  MOUNTED_WORKING_DIR: /__w/flink/flink
+  CONTAINER_LOCAL_WORKING_DIR: /root/flink
+  MAVEN_REPO_FOLDER: /root/.m2/repository
+  MAVEN_ARGS: -Dmaven.repo.local=/root/.m2/repository
+  # same PROFILE as the "Default (Java 17)" job in ci.yml, plus -Pgithub-actions as in the CI test step
+  PROFILE: -Dinclude_hadoop_aws -Djdk17 -Pjava17-target -Pgithub-actions
+
 jobs:
+  settings:
+    name: "Settings"
+    runs-on: ubuntu-24.04
+    outputs:
+      test: ${{ steps.read.outputs.test }}
+      ci-runs: ${{ steps.read.outputs.ci-runs }}
+    steps:
+      - id: read
+        run: |
+          echo "test=$TEST" >> "$GITHUB_OUTPUT"
+          echo "ci-runs=[$(seq -s, 1 "$CI_RUNS")]" >> "$GITHUB_OUTPUT"
+
+  full-ci:
+    name: "${{ matrix.variant }} CI run ${{ matrix.run }}"
+    needs: settings
+    if: needs.settings.outputs.test == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [before, after]
+        run: ${{ fromJSON(needs.settings.outputs.ci-runs) }}
+    uses: ./.github/workflows/template.flink-ci.yml
+    with:
+      workflow-caller-id: ${{ matrix.variant }}-${{ matrix.run }}
+      # before = master at the branch point, after = the fix commit
+      ref: ${{ matrix.variant == 'before' && 'a47e4bf9b9ef287d5ff7f5783df993e4cef2dd1a' || 'e8f29e93d7df8dc6d0fb879f946add582e99fad5' }}
+      # same values as the "Default (Java 17)" job in ci.yml
+      environment: 'PROFILE="-Dinclude_hadoop_aws -Djdk17 -Pjava17-target"'
+      jdk_version: 17
+    secrets:
+      s3_bucket: ${{ secrets.IT_CASE_S3_BUCKET }}
+      s3_access_key: ${{ secrets.IT_CASE_S3_ACCESS_KEY }}
+      s3_secret_key: ${{ secrets.IT_CASE_S3_SECRET_KEY }}
+
   loop:
     name: "${{ matrix.variant }} shard ${{ matrix.shard }}"
+    needs: settings
+    if: needs.settings.outputs.test != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    container:
+      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
+      options: --init --privileged
+      volumes:
+        - /mnt:/root
+    # GitHub's maximum for a job, so that only RUN_TIMEOUT_MINUTES limits the single runs
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         variant: [before, after]
         shard: [1, 2, 3, 4, 5]
-    env:
-      RUNS: 20
-      TEST: 'BlobLibraryCacheManagerTest#testApplicationLevelJarSharing+testDifferentApplicationsNotSharing'
     steps:
-      - uses: actions/checkout@v7
+      - name: "Flink Checkout"
+        uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # before = master at the branch point, after = the fix commit
           ref: ${{ matrix.variant == 'before' && 'a47e4bf9b9ef287d5ff7f5783df993e4cef2dd1a' || 'e8f29e93d7df8dc6d0fb879f946add582e99fad5' }}
-      - uses: actions/setup-java@v6
+      - name: "Initialize job"
+        uses: "./.github/actions/job_init"
         with:
-          distribution: temurin
-          java-version: 17
-      - name: Build flink-runtime and its dependencies
-        run: ./mvnw -B install -pl flink-runtime -am -DskipTests -Dfast -Pskip-webui-build -Djdk17 -Pjava17-target
-      - name: Run the tests ${{ env.RUNS }} times
+          jdk_version: 17
+          maven_repo_folder: ${{ env.MAVEN_REPO_FOLDER }}
+          source_directory: ${{ env.MOUNTED_WORKING_DIR }}
+          target_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+      - name: "Set coredump pattern"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: sudo sysctl -w kernel.core_pattern=core.%p
+      - name: "Create non-root user for test execution"
         run: |
+          useradd -m -u 1001 flink
+          echo "flink ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          mkdir -p ${{ env.CONTAINER_LOCAL_WORKING_DIR }} ${{ env.MAVEN_REPO_FOLDER }}
+          chown -R flink:flink ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+          chown -R flink:flink ${{ env.MAVEN_REPO_FOLDER }}
+      - name: "Build flink-runtime and its dependencies"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: |
+          # compile options from tools/ci/test_controller.sh, limited to flink-runtime
+          runuser -u flink -- bash -c 'source ./tools/ci/maven-utils.sh && \
+            run_mvn -Dfast -Pskip-webui-build -DskipTests -T1C $PROFILE -pl flink-runtime -am install'
+      - name: "Run the tests ${{ env.RUNS }} times"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: |
+          debug_dir="$PWD/debug_files"
+          runuser -u flink -- mkdir -p "$debug_dir"
+          # common and test options from tools/ci/test_controller.sh
+          common="-Dfast -Pskip-webui-build -Dlog.dir=$debug_dir -Dlog4j.configurationFile=file://$PWD/tools/ci/log4j.properties"
+          test_opts="-Dflink.tests.with-openssl -Dflink.tests.check-segment-multiple-free -Darchunit.freeze.store.default.allowStoreUpdate=false -Dpekko.rpc.force-invocation-serialization"
+          # the selected unit tests, with the same surefire execution that runs them in CI
+          goals="surefire:test@default-test -Dtest=$TEST"
           failed=0
           for i in $(seq 1 "$RUNS"); do
             rm -rf flink-runtime/target/surefire-reports
-            if ./mvnw -B -q surefire:test -pl flink-runtime -Dtest="$TEST" -Djdk17 -Pjava17-target; then
-              result=passed
-            else
-              result=FAILED
-            fi
-            # -q hides the test summary, so print it from the report
-            echo "run $i: $result | $(grep -h 'Tests run' flink-runtime/target/surefire-reports/*BlobLibraryCacheManagerTest.txt 2>/dev/null || echo 'no test report')"
-            if [ "$result" = FAILED ]; then
+            exit_code=0
+            timeout --kill-after=1m "${RUN_TIMEOUT_MINUTES}m" \
+              runuser -u flink -- env JAVA_TOOL_OPTIONS="-XX:+HeapDumpOnOutOfMemoryError" IS_CI=true \
+                bash -c "source ./tools/ci/maven-utils.sh && run_mvn $common $test_opts \$PROFILE -pl flink-runtime $goals" \
+              || exit_code=$?
+            case $exit_code in
+              0) result=passed ;;
+              124|137) result=TIMEOUT ;;
+              *) result=FAILED ;;
+            esac
+            summary=$(cat flink-runtime/target/surefire-reports/*.txt 2>/dev/null \
+              | awk -F'[:,]' '/Tests run/ {n++; r+=$2; f+=$4; e+=$6; s+=$8} END {if (n) printf "Tests run: %d, Failures: %d, Errors: %d, Skipped: %d", r, f, e, s; else print "no test report"}' || true)
+            echo "run $i: $result | $summary"
+            if [ "$result" != passed ]; then
               failed=$((failed + 1))
-              cp -r flink-runtime/target/surefire-reports "reports-run-$i"
+              cp -r flink-runtime/target/surefire-reports "$debug_dir/reports-run-$i"
             fi
           done
           echo "${{ matrix.variant }} shard ${{ matrix.shard }}: $failed of $RUNS runs failed" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$failed" -eq 0 ]
-      - uses: actions/upload-artifact@v7
+      - name: "Upload test reports and logs"
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: reports-${{ matrix.variant }}-${{ matrix.shard }}
-          path: reports-run-*
+          path: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}/debug_files
