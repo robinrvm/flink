@@ -66,13 +66,13 @@ env:
   #   this workflow runs in (your fork).
   # - BEFORE_COUNT: test mode: the number of test runs. Full CI mode: the number of complete
   #   CI runs. 0 skips it.
-  BEFORE_COMMIT: 'flaky-loop/FLINK-40804'
+  BEFORE_COMMIT: '9d47ab85fdecbce432b967ff47b79f47772dbef1'
   BEFORE_REPO: ''
   BEFORE_COUNT: 100
   # The code with the fix, the same way.
-  AFTER_COMMIT: ''
+  AFTER_COMMIT: 'c24db18e84e2eea9bfd57031d36b75ab7ca740f2'
   AFTER_REPO: ''
-  AFTER_COUNT: 1
+  AFTER_COUNT: 100
   # Keep exactly one TEST line uncommented.
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
