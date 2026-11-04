@@ -66,15 +66,15 @@ env:
   #   this workflow runs in (your fork).
   # - BEFORE_COUNT: test mode: the number of test runs. Full CI mode: the number of complete
   #   CI runs. 0 skips it.
-  # FLINK-40804: "before" is the instrumented test case 3 with the failing parallelism
-  # (rescaled Map after keyBy 1), "after" is the control with only Map after keyBy set to 5.
-  BEFORE_COMMIT: '71996dfc218ecf8c9a1952126147223355107ffc'
+  # FLINK-40804: "before" takes checkpoint 1 0 ms after all tasks are RUNNING (small in-flight
+  # data), "after" 900 ms after (large in-flight data). Both restore with Map after keyBy 1.
+  BEFORE_COMMIT: '713b96fa5a7d9adf1b013bb2e1d9608233d997e0'
   BEFORE_REPO: ''
-  BEFORE_COUNT: 100
+  BEFORE_COUNT: 10
   # The code with the fix, the same way.
-  AFTER_COMMIT: 'd35555185e251bd3ee416551250d56296c5630ea'
+  AFTER_COMMIT: 'af4a1c14f4cdde2289e94552a298e763c3b60567'
   AFTER_REPO: ''
-  AFTER_COUNT: 100
+  AFTER_COUNT: 10
   # Keep exactly one TEST line uncommented.
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
@@ -262,8 +262,8 @@ jobs:
           debug_dir="$PWD/debug_files"
           reports="$MODULE/target/surefire-reports"
           runuser -u flink -- mkdir -p "$debug_dir"
-          # FLINK-40804: all times in IST, 12-hour clock with milliseconds, like the test logs
-          ist() { TZ=Asia/Kolkata date '+%d-%m-%Y %I:%M:%S.%3N %p IST'; }
+          # FLINK-40804: all times in IST (POSIX TZ, the container has no zoneinfo), 12-hour clock with milliseconds, like the test logs
+          ist() { TZ=IST-5:30 date '+%d-%m-%Y %I:%M:%S.%3N %p IST'; }
           # FLINK-40804: CPU, run queue, memory and steal time of this machine, every second
           (
             echo "time | $(vmstat -w 1 1 | sed -n 2p)"
