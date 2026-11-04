@@ -39,6 +39,7 @@ import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -88,6 +89,13 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
     /** The number of non-event buffers currently in this subpartition. */
     @GuardedBy("buffers")
     private int buffersInBacklog;
+
+    /**
+     * FLINK-40804 (flaky test loop only, not for upstream): checkpoint ID and enqueue time (ms) of
+     * every aligned barrier that is in {@link #buffers}, oldest first.
+     */
+    @GuardedBy("buffers")
+    private final ArrayDeque<long[]> alignedBarriersInQueue = new ArrayDeque<>();
 
     /** The read view to consume this subpartition. */
     PipelinedSubpartitionView readView;
@@ -183,6 +191,9 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
             // Add the bufferConsumer and update the stats
             if (addBuffer(bufferConsumer, partialRecordLength)) {
                 prioritySequenceNumber = sequenceNumber;
+            }
+            if (Buffer.DataType.ALIGNED_CHECKPOINT_BARRIER == bufferConsumer.getDataType()) {
+                logAlignedBarrierAdded(bufferConsumer);
             }
             updateStatistics(bufferConsumer);
             increaseBuffersInBacklog(bufferConsumer);
@@ -416,6 +427,86 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
         return barrier;
     }
 
+    // ------------------------------------------------------------------------
+    // FLINK-40804 (flaky test loop only, not for upstream): where aligned barriers wait.
+    // Aligned barriers (e.g. on forward exchanges) can't overtake data, so every buffer queued
+    // before them has to be consumed first. Unaligned (priority) barriers are not logged.
+    // ------------------------------------------------------------------------
+
+    @GuardedBy("buffers")
+    private void logAlignedBarrierAdded(BufferConsumer barrierConsumer) {
+        CheckpointBarrier barrier = parseCheckpointBarrier(barrierConsumer);
+        long checkpointId = barrier == null ? -1 : barrier.getId();
+        alignedBarriersInQueue.add(new long[] {checkpointId, System.currentTimeMillis()});
+
+        // the barrier was added last, so everything before it is ahead of it
+        int ahead = buffers.size() - 1;
+        int dataBuffersAhead = 0;
+        long writtenBytesAhead = 0;
+        Iterator<BufferConsumerWithPartialRecordLength> iterator = buffers.iterator();
+        for (int i = 0; i < ahead && iterator.hasNext(); i++) {
+            BufferConsumer consumer = iterator.next().getBufferConsumer();
+            if (consumer.isBuffer()) {
+                dataBuffersAhead++;
+                writtenBytesAhead += consumer.getWrittenBytes();
+            }
+        }
+        LOG.info(
+                "F40804-BARRIER-IN task={} output={} channel={} checkpointId={} queueLength={} dataBuffersAhead={} writtenBytesAhead={}",
+                parent.getOwningTaskName(),
+                subpartitionInfo.getPartitionIdx(),
+                subpartitionInfo.getSubPartitionIdx(),
+                checkpointId,
+                buffers.size(),
+                dataBuffersAhead,
+                writtenBytesAhead);
+    }
+
+    @GuardedBy("buffers")
+    private void logAlignedBarrierPolled() {
+        long[] barrier = alignedBarriersInQueue.poll();
+        LOG.info(
+                "F40804-BARRIER-OUT task={} output={} channel={} checkpointId={} waitedInQueueMs={} queueLengthBehind={}",
+                parent.getOwningTaskName(),
+                subpartitionInfo.getPartitionIdx(),
+                subpartitionInfo.getSubPartitionIdx(),
+                barrier == null ? -1 : barrier[0],
+                barrier == null ? -1 : System.currentTimeMillis() - barrier[1],
+                buffers.size() - 1);
+    }
+
+    /** Logs the aligned barriers that never left the queue (e.g. the job failed or was cancelled). */
+    @GuardedBy("buffers")
+    private void logAlignedBarriersAtRelease() {
+        if (alignedBarriersInQueue.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Iterator<long[]> barriers = alignedBarriersInQueue.iterator();
+        int dataBuffersAhead = 0;
+        long writtenBytesAhead = 0;
+        for (BufferConsumerWithPartialRecordLength element : buffers) {
+            BufferConsumer consumer = element.getBufferConsumer();
+            if (Buffer.DataType.ALIGNED_CHECKPOINT_BARRIER == consumer.getDataType()
+                    && barriers.hasNext()) {
+                long[] barrier = barriers.next();
+                LOG.info(
+                        "F40804-BARRIER-AT-RELEASE task={} output={} channel={} checkpointId={} waitedInQueueMs={} dataBuffersAhead={} writtenBytesAhead={}",
+                        parent.getOwningTaskName(),
+                        subpartitionInfo.getPartitionIdx(),
+                        subpartitionInfo.getSubPartitionIdx(),
+                        barrier[0],
+                        now - barrier[1],
+                        dataBuffersAhead,
+                        writtenBytesAhead);
+            } else if (consumer.isBuffer()) {
+                dataBuffersAhead++;
+                writtenBytesAhead += consumer.getWrittenBytes();
+            }
+        }
+        alignedBarriersInQueue.clear();
+    }
+
     @Override
     public void release() {
         // view reference accessible outside the lock, but assigned inside the locked scope
@@ -425,6 +516,8 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
             if (isReleased) {
                 return;
             }
+
+            logAlignedBarriersAtRelease();
 
             // Release all available buffers
             for (BufferConsumerWithPartialRecordLength buffer : buffers) {
@@ -486,6 +579,10 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
                 }
 
                 if (bufferConsumer.isFinished()) {
+                    if (Buffer.DataType.ALIGNED_CHECKPOINT_BARRIER
+                            == bufferConsumer.getDataType()) {
+                        logAlignedBarrierPolled();
+                    }
                     requireNonNull(buffers.poll()).getBufferConsumer().close();
                     decreaseBuffersInBacklogUnsafe(bufferConsumer.isBuffer());
                 }
