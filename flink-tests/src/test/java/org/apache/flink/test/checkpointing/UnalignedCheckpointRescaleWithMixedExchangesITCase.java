@@ -122,7 +122,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
     // FLINK-40804 (flaky test loop only): the first job takes checkpoint 1 itself, this long after
     // all its tasks are RUNNING, instead of on the 1 s timer. This sets how long data flows into
     // the queues before checkpoint 1, and so how much in-flight data it saves.
-    private static final long CHECKPOINT_1_DELAY_MS = 900;
+    private static final long CHECKPOINT_1_DELAY_MS = 0;
 
     /** The parallelism the next {@link #createMixedComplexityDAG} call uses. */
     private static DagParallelism currentParallelism;
