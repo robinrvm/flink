@@ -68,11 +68,11 @@ env:
   #   CI runs. 0 skips it.
   # FLINK-40804: "before" is the instrumented test case 3 with the failing parallelism
   # (rescaled Map after keyBy 1), "after" is the control with only Map after keyBy set to 5.
-  BEFORE_COMMIT: 'TODO'
+  BEFORE_COMMIT: '71996dfc218ecf8c9a1952126147223355107ffc'
   BEFORE_REPO: ''
   BEFORE_COUNT: 100
   # The code with the fix, the same way.
-  AFTER_COMMIT: 'TODO'
+  AFTER_COMMIT: 'd35555185e251bd3ee416551250d56296c5630ea'
   AFTER_REPO: ''
   AFTER_COUNT: 100
   # Keep exactly one TEST line uncommented.
