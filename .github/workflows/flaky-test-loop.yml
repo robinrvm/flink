@@ -68,11 +68,11 @@ env:
   #   CI runs. 0 skips it.
   # FLINK-40804: "before" takes checkpoint 1 0 ms after all tasks are RUNNING (small in-flight
   # data), "after" 900 ms after (large in-flight data). Both restore with Map after keyBy 1.
-  BEFORE_COMMIT: '9499a19168f592ba928ae914715abe66a1d5c687'
+  BEFORE_COMMIT: '2cacb7009c3d1fd2402f281d0ed147ac0d6afe05'
   BEFORE_REPO: ''
   BEFORE_COUNT: 10
   # The code with the fix, the same way.
-  AFTER_COMMIT: 'b696067842ad44c92073af15985ea12b13f7abd8'
+  AFTER_COMMIT: '490c59dbdbe9172a67563e89fe6ba5500c816b6e'
   AFTER_REPO: ''
   AFTER_COUNT: 10
   # Keep exactly one TEST line uncommented.
