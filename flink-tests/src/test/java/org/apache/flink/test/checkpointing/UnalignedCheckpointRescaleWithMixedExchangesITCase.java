@@ -47,8 +47,10 @@ import org.apache.flink.runtime.checkpoint.CheckpointStatsStatus;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpointStats;
 import org.apache.flink.runtime.checkpoint.SubtaskStateStats;
 import org.apache.flink.runtime.checkpoint.TaskStateStats;
+import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
+import org.apache.flink.runtime.executiongraph.AccessExecutionVertex;
 import org.apache.flink.runtime.metrics.scope.ScopeFormat;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
@@ -196,6 +198,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
                     CHECKPOINT_1_DELAY_MS);
             checkpointPath = miniCluster.triggerCheckpoint(jobClient1.getJobID()).get();
             log.info("F40804-CHECKPOINT1 completed: {}", checkpointPath);
+            logInFlightDataPerTask(miniCluster, jobClient1.getJobID());
             CommonTestUtils.terminateJob(jobClient1);
         }
 
@@ -212,6 +215,42 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
                     jobClient2.getJobID(), miniCluster);
             CommonTestUtils.terminateJob(jobClient2);
         }
+    }
+
+    /**
+     * FLINK-40804 (flaky test loop only): logs the in-flight data (bytes persisted for unaligned
+     * checkpoints) per task and subtask of the latest completed checkpoint, which the restored job
+     * replays while INITIALIZING.
+     */
+    private void logInFlightDataPerTask(MiniCluster miniCluster, JobID jobId) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            AccessExecutionGraph graph =
+                    miniCluster.getExecutionGraph(jobId).get(5, TimeUnit.SECONDS);
+            CheckpointStatsSnapshot snapshot = graph.getCheckpointStatsSnapshot();
+            CompletedCheckpointStats latest =
+                    snapshot == null ? null : snapshot.getHistory().getLatestCompletedCheckpoint();
+            if (latest != null) {
+                for (TaskStateStats task : latest.getAllTaskStateStats()) {
+                    AccessExecutionJobVertex vertex = graph.getJobVertex(task.getJobVertexId());
+                    StringBuilder perSubtask = new StringBuilder();
+                    for (SubtaskStateStats subtask : task.getSubtaskStats()) {
+                        perSubtask
+                                .append(perSubtask.length() == 0 ? "" : ", ")
+                                .append(subtask == null ? "-" : subtask.getPersistedData());
+                    }
+                    log.info(
+                            "F40804-CKPT-INFLIGHT checkpointId={} task=\"{}\" persistedDataBytes={} perSubtask=[{}]",
+                            latest.getCheckpointId(),
+                            vertex == null ? task.getJobVertexId() : vertex.getName(),
+                            task.getPersistedDataStats(),
+                            perSubtask);
+                }
+                return;
+            }
+            Thread.sleep(100);
+        }
+        log.info("F40804-CKPT-INFLIGHT no completed checkpoint in the stats within 10 s");
     }
 
     private StreamExecutionEnvironment getUnalignedCheckpointEnv(@Nullable String recoveryPath)
@@ -494,8 +533,9 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
      *   <li>F40804-JVM: CPU, heap, GC and threads of this JVM, which runs the MiniCluster.
      * </ul>
      *
-     * <p>F40804-THREADS: stack traces of the task threads when a checkpoint has been in progress
-     * for 60 s, 300 s and 590 s (the checkpoint timeout is 600 s).
+     * <p>F40804-THREADS: stack traces of the task threads every 3 s while subtasks are
+     * INITIALIZING (at most 15 times per job), and when a checkpoint has been in progress for 60 s,
+     * 300 s and 590 s (the checkpoint timeout is 600 s).
      */
     private static final class Sampler implements AutoCloseable {
         private static final Logger LOG = LoggerFactory.getLogger(Sampler.class);
@@ -531,6 +571,11 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
 
         private static final long[] THREAD_DUMP_AFTER_MS = {60_000, 300_000, 590_000};
 
+        /** Restored tasks were INITIALIZING for up to 28.5 s in the failed runs so far. */
+        private static final int MAX_RESTORE_DUMPS = 15;
+
+        private static final long RESTORE_DUMP_INTERVAL_MS = 3_000;
+
         /** Task thread names, e.g. "Map after keyBy (1/1)#0". */
         private static final Pattern TASK_THREAD_NAME = Pattern.compile(".+ \\(\\d+/\\d+\\)#\\d+");
 
@@ -543,6 +588,9 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
         private final Map<String, long[]> previousRecords = new HashMap<>();
 
         private final Set<String> threadDumpsDone = new HashSet<>();
+
+        private int restoreDumps;
+        private long nextRestoreDumpMs;
 
         private Sampler(
                 MiniCluster miniCluster, JobID jobId, String phase, DagParallelism parallelism) {
@@ -644,6 +692,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
         private void logCheckpoints() throws Exception {
             AccessExecutionGraph graph =
                     miniCluster.getExecutionGraph(jobId).get(5, TimeUnit.SECONDS);
+            dumpThreadsWhileInitializing(graph);
             CheckpointStatsSnapshot snapshot = graph.getCheckpointStatsSnapshot();
             if (snapshot == null) {
                 return;
@@ -701,14 +750,37 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
                     if (ageMs >= dumpAfterMs
                             && threadDumpsDone.add(
                                     checkpoint.getCheckpointId() + "@" + dumpAfterMs)) {
-                        dumpTaskThreads(checkpoint.getCheckpointId(), ageMs);
+                        dumpTaskThreads(
+                                "checkpointId=" + checkpoint.getCheckpointId() + " ageMs=" + ageMs);
                         break;
                     }
                 }
             }
         }
 
-        private void dumpTaskThreads(long checkpointId, long ageMs) {
+        /** Thread dumps while subtasks are INITIALIZING, e.g. replaying restored in-flight data. */
+        private void dumpThreadsWhileInitializing(AccessExecutionGraph graph) {
+            long now = System.currentTimeMillis();
+            if (restoreDumps >= MAX_RESTORE_DUMPS || now < nextRestoreDumpMs) {
+                return;
+            }
+            StringBuilder initializing = new StringBuilder();
+            for (AccessExecutionVertex vertex : graph.getAllExecutionVertices()) {
+                if (vertex.getExecutionState() == ExecutionState.INITIALIZING) {
+                    initializing
+                            .append(initializing.length() == 0 ? "" : ", ")
+                            .append(vertex.getTaskNameWithSubtaskIndex());
+                }
+            }
+            if (initializing.length() == 0) {
+                return;
+            }
+            restoreDumps++;
+            nextRestoreDumpMs = now + RESTORE_DUMP_INTERVAL_MS;
+            dumpTaskThreads("initializingDump=" + restoreDumps + " initializing=[" + initializing + "]");
+        }
+
+        private void dumpTaskThreads(String reason) {
             StringBuilder dump = new StringBuilder();
             for (ThreadInfo thread :
                     ManagementFactory.getThreadMXBean().dumpAllThreads(false, false)) {
@@ -723,16 +795,11 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
                     dump.append(" on ").append(thread.getLockName());
                 }
                 StackTraceElement[] stack = thread.getStackTrace();
-                for (int i = 0; i < Math.min(stack.length, 25); i++) {
+                for (int i = 0; i < Math.min(stack.length, 40); i++) {
                     dump.append("\n    at ").append(stack[i]);
                 }
             }
-            LOG.info(
-                    "F40804-THREADS phase={} checkpointId={} ageMs={}{}",
-                    phase,
-                    checkpointId,
-                    ageMs,
-                    dump);
+            LOG.info("F40804-THREADS phase={} {}{}", phase, reason, dump);
         }
 
         private void logJvm() {

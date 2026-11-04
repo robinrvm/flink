@@ -442,24 +442,24 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
         // the barrier was added last, so everything before it is ahead of it
         int ahead = buffers.size() - 1;
         int dataBuffersAhead = 0;
-        long writtenBytesAhead = 0;
+        long readableBytesAhead = 0;
         Iterator<BufferConsumerWithPartialRecordLength> iterator = buffers.iterator();
         for (int i = 0; i < ahead && iterator.hasNext(); i++) {
             BufferConsumer consumer = iterator.next().getBufferConsumer();
             if (consumer.isBuffer()) {
                 dataBuffersAhead++;
-                writtenBytesAhead += consumer.getWrittenBytes();
+                readableBytesAhead += readableBytes(consumer);
             }
         }
         LOG.info(
-                "F40804-BARRIER-IN task={} output={} channel={} checkpointId={} queueLength={} dataBuffersAhead={} writtenBytesAhead={}",
+                "F40804-BARRIER-IN task={} output={} channel={} checkpointId={} queueLength={} dataBuffersAhead={} readableBytesAhead={}",
                 parent.getOwningTaskName(),
                 subpartitionInfo.getPartitionIdx(),
                 subpartitionInfo.getSubPartitionIdx(),
                 checkpointId,
                 buffers.size(),
                 dataBuffersAhead,
-                writtenBytesAhead);
+                readableBytesAhead);
     }
 
     @GuardedBy("buffers")
@@ -484,27 +484,43 @@ public class PipelinedSubpartition extends ResultSubpartition implements Channel
         long now = System.currentTimeMillis();
         Iterator<long[]> barriers = alignedBarriersInQueue.iterator();
         int dataBuffersAhead = 0;
-        long writtenBytesAhead = 0;
+        long readableBytesAhead = 0;
         for (BufferConsumerWithPartialRecordLength element : buffers) {
             BufferConsumer consumer = element.getBufferConsumer();
             if (Buffer.DataType.ALIGNED_CHECKPOINT_BARRIER == consumer.getDataType()
                     && barriers.hasNext()) {
                 long[] barrier = barriers.next();
                 LOG.info(
-                        "F40804-BARRIER-AT-RELEASE task={} output={} channel={} checkpointId={} waitedInQueueMs={} dataBuffersAhead={} writtenBytesAhead={}",
+                        "F40804-BARRIER-AT-RELEASE task={} output={} channel={} checkpointId={} waitedInQueueMs={} dataBuffersAhead={} readableBytesAhead={}",
                         parent.getOwningTaskName(),
                         subpartitionInfo.getPartitionIdx(),
                         subpartitionInfo.getSubPartitionIdx(),
                         barrier[0],
                         now - barrier[1],
                         dataBuffersAhead,
-                        writtenBytesAhead);
+                        readableBytesAhead);
             } else if (consumer.isBuffer()) {
                 dataBuffersAhead++;
-                writtenBytesAhead += consumer.getWrittenBytes();
+                readableBytesAhead += readableBytes(consumer);
             }
         }
         alignedBarriersInQueue.clear();
+    }
+
+    /**
+     * The bytes not yet read from the buffer. {@link BufferConsumer#getWrittenBytes()} can't be
+     * used: it is only updated when the reader reads, so it is 0 for buffers not read yet. A copy
+     * has its own reader position, so building it doesn't change the queued buffer.
+     */
+    private static int readableBytes(BufferConsumer consumer) {
+        try (BufferConsumer copy = consumer.copy()) {
+            Buffer buffer = copy.build();
+            try {
+                return buffer.readableBytes();
+            } finally {
+                buffer.recycleBuffer();
+            }
+        }
     }
 
     @Override
