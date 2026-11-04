@@ -40,19 +40,33 @@ import org.apache.flink.metrics.Gauge;
 import org.apache.flink.metrics.Meter;
 import org.apache.flink.metrics.Metric;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.checkpoint.AbstractCheckpointStats;
+import org.apache.flink.runtime.checkpoint.Checkpoints;
 import org.apache.flink.runtime.checkpoint.CheckpointStatsCounts;
 import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
 import org.apache.flink.runtime.checkpoint.CheckpointStatsStatus;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpointStats;
+import org.apache.flink.runtime.checkpoint.OperatorState;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.SubtaskStateStats;
 import org.apache.flink.runtime.checkpoint.TaskStateStats;
+import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
+import org.apache.flink.runtime.checkpoint.channel.ResultSubpartitionInfo;
+import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
 import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
 import org.apache.flink.runtime.executiongraph.AccessExecutionVertex;
+import org.apache.flink.runtime.jobgraph.IntermediateDataSet;
+import org.apache.flink.runtime.jobgraph.JobEdge;
+import org.apache.flink.runtime.jobgraph.JobVertex;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.metrics.scope.ScopeFormat;
 import org.apache.flink.runtime.minicluster.MiniCluster;
+import org.apache.flink.runtime.state.InputChannelStateHandle;
+import org.apache.flink.runtime.state.ResultSubpartitionStateHandle;
+import org.apache.flink.runtime.state.filesystem.AbstractFsCheckpointStorageAccess;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.apache.flink.runtime.testutils.InMemoryReporter;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
@@ -77,12 +91,14 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.io.DataInputStream;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryUsage;
 import java.lang.management.OperatingSystemMXBean;
 import java.lang.management.ThreadInfo;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -122,10 +138,22 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
     // FLINK-40804 (flaky test loop only): the first job takes checkpoint 1 itself, this long after
     // all its tasks are RUNNING, instead of on the 1 s timer. This sets how long data flows into
     // the queues before checkpoint 1, and so how much in-flight data it saves.
-    private static final long CHECKPOINT_1_DELAY_MS = 0;
+    private static final long CHECKPOINT_1_DELAY_MS = 900;
 
     /** The parallelism the next {@link #createMixedComplexityDAG} call uses. */
     private static DagParallelism currentParallelism;
+
+    /**
+     * FLINK-40804 (flaky test loop only): topology of the last submitted job, to name the input
+     * gates and output partitions of the in-flight data in the checkpoint metadata.
+     */
+    private static final Map<OperatorID, String> TASK_BY_OPERATOR = new HashMap<>();
+
+    /** Per task: the upstream task of each input gate, by gate index. */
+    private static final Map<String, List<String>> GATES_BY_TASK = new HashMap<>();
+
+    /** Per task: the downstream task of each output partition, by partition index. */
+    private static final Map<String, List<String>> PARTITIONS_BY_TASK = new HashMap<>();
 
     private static InMemoryReporter reporter;
     private static MiniClusterWithClientResource cluster;
@@ -199,6 +227,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
             checkpointPath = miniCluster.triggerCheckpoint(jobClient1.getJobID()).get();
             log.info("F40804-CHECKPOINT1 completed: {}", checkpointPath);
             logInFlightDataPerTask(miniCluster, jobClient1.getJobID());
+            logInFlightDataPerChannel(checkpointPath);
             CommonTestUtils.terminateJob(jobClient1);
         }
 
@@ -251,6 +280,150 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
             Thread.sleep(100);
         }
         log.info("F40804-CKPT-INFLIGHT no completed checkpoint in the stats within 10 s");
+    }
+
+    /**
+     * FLINK-40804 (flaky test loop only): logs the in-flight data of the checkpoint per subtask,
+     * split by input gate (named by its upstream task) and output partition (named by its
+     * downstream task), read from the checkpoint metadata.
+     */
+    private void logInFlightDataPerChannel(String checkpointPath) {
+        try {
+            for (Map.Entry<String, List<String>> gates : new TreeMap<>(GATES_BY_TASK).entrySet()) {
+                log.info(
+                        "F40804-TOPOLOGY task=\"{}\" inputGates={} outputPartitions={}",
+                        gates.getKey(),
+                        gates.getValue(),
+                        PARTITIONS_BY_TASK.get(gates.getKey()));
+            }
+            CheckpointMetadata metadata;
+            try (DataInputStream in =
+                    new DataInputStream(
+                            AbstractFsCheckpointStorageAccess.resolveCheckpointPointer(
+                                            checkpointPath)
+                                    .getMetadataHandle()
+                                    .openInputStream())) {
+                metadata =
+                        Checkpoints.loadCheckpointMetadata(
+                                in, getClass().getClassLoader(), checkpointPath);
+            }
+            for (OperatorState operator : metadata.getOperatorStates()) {
+                String task =
+                        TASK_BY_OPERATOR.getOrDefault(
+                                operator.getOperatorID(), operator.getOperatorID().toString());
+                List<String> gates = GATES_BY_TASK.getOrDefault(task, Collections.emptyList());
+                List<String> partitions =
+                        PARTITIONS_BY_TASK.getOrDefault(task, Collections.emptyList());
+                // key: "input gate N from X" or "output partition N to X", value: bytes, channels
+                Map<String, long[]> taskTotals = new TreeMap<>();
+                for (Map.Entry<Integer, OperatorSubtaskState> subtask :
+                        new TreeMap<>(operator.getSubtaskStates()).entrySet()) {
+                    Map<String, Map<Integer, Long>> bytesPerChannel = new TreeMap<>();
+                    for (InputChannelStateHandle handle :
+                            subtask.getValue().getInputChannelState()) {
+                        InputChannelInfo info = handle.getInfo();
+                        bytesPerChannel
+                                .computeIfAbsent(
+                                        "input gate "
+                                                + info.getGateIdx()
+                                                + " from "
+                                                + nameAt(gates, info.getGateIdx()),
+                                        unused -> new TreeMap<>())
+                                .merge(info.getInputChannelIdx(), handle.getStateSize(), Long::sum);
+                    }
+                    for (ResultSubpartitionStateHandle handle :
+                            subtask.getValue().getResultSubpartitionState()) {
+                        ResultSubpartitionInfo info = handle.getInfo();
+                        bytesPerChannel
+                                .computeIfAbsent(
+                                        "output partition "
+                                                + info.getPartitionIdx()
+                                                + " to "
+                                                + nameAt(partitions, info.getPartitionIdx()),
+                                        unused -> new TreeMap<>())
+                                .merge(info.getSubPartitionIdx(), handle.getStateSize(), Long::sum);
+                    }
+                    for (Map.Entry<String, Map<Integer, Long>> side : bytesPerChannel.entrySet()) {
+                        long bytes = 0;
+                        for (long channelBytes : side.getValue().values()) {
+                            bytes += channelBytes;
+                        }
+                        long[] total =
+                                taskTotals.computeIfAbsent(side.getKey(), unused -> new long[2]);
+                        total[0] += bytes;
+                        total[1] += side.getValue().size();
+                        log.info(
+                                "F40804-INFLIGHT-CHANNEL checkpointId={} task=\"{}\" subtask={} side=\"{}\" bytes={} bytesPerChannel={}",
+                                metadata.getCheckpointId(),
+                                task,
+                                subtask.getKey(),
+                                side.getKey(),
+                                bytes,
+                                side.getValue());
+                    }
+                }
+                if (taskTotals.isEmpty()) {
+                    log.info(
+                            "F40804-INFLIGHT-SPLIT checkpointId={} task=\"{}\" side=\"none\" bytes=0",
+                            metadata.getCheckpointId(),
+                            task);
+                }
+                for (Map.Entry<String, long[]> side : taskTotals.entrySet()) {
+                    log.info(
+                            "F40804-INFLIGHT-SPLIT checkpointId={} task=\"{}\" side=\"{}\" bytes={} channelsWithData={}",
+                            metadata.getCheckpointId(),
+                            task,
+                            side.getKey(),
+                            side.getValue()[0],
+                            side.getValue()[1]);
+                }
+            }
+        } catch (Exception e) {
+            log.info("F40804-INFLIGHT-SPLIT not available: {}", e.toString());
+        }
+    }
+
+    private static String nameAt(List<String> names, int index) {
+        return index < names.size() ? "\"" + names.get(index) + "\"" : "unknown";
+    }
+
+    /**
+     * FLINK-40804 (flaky test loop only): records the topology of the job about to be submitted.
+     * Gate N of a task is its N-th JobVertex input and partition N its N-th produced data set, in
+     * the same order the runtime creates them.
+     */
+    private static void recordTopology(StreamExecutionEnvironment env) {
+        TASK_BY_OPERATOR.clear();
+        GATES_BY_TASK.clear();
+        PARTITIONS_BY_TASK.clear();
+        for (JobVertex vertex : env.getStreamGraph(false).getJobGraph().getVertices()) {
+            for (OperatorIDPair ids : vertex.getOperatorIDs()) {
+                TASK_BY_OPERATOR.put(ids.getGeneratedOperatorID(), vertex.getName());
+            }
+            List<String> gates = new ArrayList<>();
+            for (JobEdge edge : vertex.getInputs()) {
+                gates.add(
+                        edge.getSource().getProducer().getName()
+                                + " ("
+                                + edge.getShipStrategyName()
+                                + ")");
+            }
+            List<String> partitions = new ArrayList<>();
+            for (IntermediateDataSet dataSet : vertex.getProducedDataSets()) {
+                StringBuilder consumers = new StringBuilder();
+                for (JobEdge edge : dataSet.getConsumers()) {
+                    consumers
+                            .append(consumers.length() == 0 ? "" : ", ")
+                            .append(edge.getTarget().getName())
+                            .append(" (")
+                            .append(edge.getShipStrategyName())
+                            .append(")");
+                }
+                partitions.add(consumers.toString());
+            }
+            GATES_BY_TASK.put(vertex.getName(), gates);
+            PARTITIONS_BY_TASK.put(vertex.getName(), partitions);
+        }
     }
 
     private StreamExecutionEnvironment getUnalignedCheckpointEnv(@Nullable String recoveryPath)
@@ -422,6 +595,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
                 .name("Map after forward")
                 .setParallelism(multiInputMap.getParallelism());
 
+        recordTopology(env);
         return env.executeAsync();
     }
 
