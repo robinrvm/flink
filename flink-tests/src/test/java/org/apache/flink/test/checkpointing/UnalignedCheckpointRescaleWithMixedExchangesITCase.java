@@ -115,7 +115,7 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
     // set to a combination that often fails (Source 1, Source 2 + Map, Co-Map + Map after
     // forward, Map after keyBy).
     private static final DagParallelism INITIAL_PARALLELISM = new DagParallelism(8, 5, 10, 6);
-    private static final DagParallelism RESCALED_PARALLELISM = new DagParallelism(2, 4, 4, 1);
+    private static final DagParallelism RESCALED_PARALLELISM = new DagParallelism(2, 4, 4, 5);
 
     /** The parallelism the next {@link #createMixedComplexityDAG} call uses. */
     private static DagParallelism currentParallelism;
