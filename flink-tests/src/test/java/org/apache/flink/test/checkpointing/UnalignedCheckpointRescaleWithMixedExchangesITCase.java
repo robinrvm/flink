@@ -115,7 +115,12 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
     // set to a combination that often fails (Source 1, Source 2 + Map, Co-Map + Map after
     // forward, Map after keyBy).
     private static final DagParallelism INITIAL_PARALLELISM = new DagParallelism(8, 5, 10, 6);
-    private static final DagParallelism RESCALED_PARALLELISM = new DagParallelism(2, 4, 4, 5);
+    private static final DagParallelism RESCALED_PARALLELISM = new DagParallelism(2, 4, 4, 1);
+
+    // FLINK-40804 (flaky test loop only): the first job takes checkpoint 1 itself, this long after
+    // all its tasks are RUNNING, instead of on the 1 s timer. This sets how long data flows into
+    // the queues before checkpoint 1, and so how much in-flight data it saves.
+    private static final long CHECKPOINT_1_DELAY_MS = 0;
 
     /** The parallelism the next {@link #createMixedComplexityDAG} call uses. */
     private static DagParallelism currentParallelism;
@@ -185,9 +190,12 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
             CommonTestUtils.waitForJobStatus(
                     jobClient1, Collections.singletonList(JobStatus.RUNNING));
             CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient1.getJobID(), false);
-            checkpointPath =
-                    CommonTestUtils.waitForCheckpointWithInflightBuffers(
-                            jobClient1.getJobID(), miniCluster);
+            Thread.sleep(CHECKPOINT_1_DELAY_MS);
+            log.info(
+                    "F40804-CHECKPOINT1 triggering checkpoint 1 {} ms after all tasks are RUNNING",
+                    CHECKPOINT_1_DELAY_MS);
+            checkpointPath = miniCluster.triggerCheckpoint(jobClient1.getJobID()).get();
+            log.info("F40804-CHECKPOINT1 completed: {}", checkpointPath);
             CommonTestUtils.terminateJob(jobClient1);
         }
 
@@ -209,7 +217,11 @@ public class UnalignedCheckpointRescaleWithMixedExchangesITCase extends TestLogg
     private StreamExecutionEnvironment getUnalignedCheckpointEnv(@Nullable String recoveryPath)
             throws IOException {
         Configuration conf = new Configuration();
-        conf.set(CheckpointingOptions.CHECKPOINTING_INTERVAL, Duration.ofSeconds(1));
+        // FLINK-40804 (flaky test loop only): no timer checkpoints in the first job, it takes
+        // checkpoint 1 itself (see CHECKPOINT_1_DELAY_MS). The restored job is unchanged.
+        conf.set(
+                CheckpointingOptions.CHECKPOINTING_INTERVAL,
+                recoveryPath == null ? Duration.ofHours(1) : Duration.ofSeconds(1));
         // Disable aligned timeout to ensure it works with unaligned checkpoint directly
         conf.set(CheckpointingOptions.ALIGNED_CHECKPOINT_TIMEOUT, Duration.ofSeconds(0));
         conf.set(RestartStrategyOptions.RESTART_STRATEGY, NO_RESTART_STRATEGY.getMainValue());
