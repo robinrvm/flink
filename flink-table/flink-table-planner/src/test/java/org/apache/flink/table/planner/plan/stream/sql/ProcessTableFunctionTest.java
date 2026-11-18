@@ -723,7 +723,9 @@ class ProcessTableFunctionTest extends TableTestBase {
                                 + "In such cases, ensure that the sink is able to digest upserts where the PRIMARY KEY serves as the upsert key, or make the input produce UPDATE_BEFORE.\n\n"
                                 + "The conflict is at:\n"
                                 + "Sink(expectedChangelogMode=[I,UB,UA,D])\n"
-                                + "  +- ProcessTableFunction(changelogMode=[I,UA,D])"),
+                                + "  +- ProcessTableFunction(changelogMode=[I,UA,D])"
+                                + "\n\nTo see which operators produce the upsert changelog,"
+                                + " run 'EXPLAIN CHANGELOG_MODE' on the SELECT part of the statement."),
                 ErrorSpec.ofSelect(
                         "upsert conflict that does not surface at a sink",
                         UpdatingUpsertFunction.class,
@@ -750,7 +752,9 @@ class ProcessTableFunctionTest extends TableTestBase {
                                 + "In such cases, ensure that the sink is able to digest upserts where the PRIMARY KEY serves as the upsert key, or make the input produce UPDATE_BEFORE.\n\n"
                                 + "The conflict is at:\n"
                                 + "Sink(expectedChangelogMode=[I,UB,UA,D])\n"
-                                + "  +- Calc(changelogMode=[I,UA,D])"),
+                                + "  +- Calc(changelogMode=[I,UA,D])"
+                                + "\n\nTo see which operators produce the upsert changelog,"
+                                + " run 'EXPLAIN CHANGELOG_MODE' on the SELECT part of the statement."),
                 ErrorSpec.ofSelect(
                         "no pass-through for multiple table args",
                         InvalidPassThroughTables.class,

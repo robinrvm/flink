@@ -49,10 +49,17 @@ import org.apache.calcite.rel.core.JoinRelType
 import org.apache.calcite.rex.RexCall
 import org.apache.calcite.util.ImmutableBitSet
 
+import java.util.{Collections, IdentityHashMap}
+
 import scala.collection.JavaConversions._
+import scala.collection.mutable
+import scala.util.control.NonFatal
 
 /** An optimize program to infer ChangelogMode for every physical node. */
 class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOptimizeContext] {
+
+  // toDataStream() and toChangelogStream() write into an anonymous table with this name prefix
+  private val dataStreamSinkNamePrefix = "*anonymous_datastream_sink$"
 
   override def optimize(root: RelNode, context: StreamOptimizeContext): RelNode = {
     // step1: satisfy ModifyKindSet trait
@@ -132,13 +139,25 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
       val conflict = new StringBuilder(describeChangelog(rootWithModifyKindSet))
       rootWithModifyKindSet.getInputs.foreach(
         input => conflict.append("\n  +- ").append(describeChangelog(input)))
+      val sinkName = rootWithModifyKindSet
+        .asInstanceOf[StreamPhysicalSink]
+        .contextResolvedTable
+        .getIdentifier
+        .asSummaryString()
+      // EXPLAIN on the failing statement fails with this same error
+      val investigate = if (sinkName.startsWith(dataStreamSinkNamePrefix)) {
+        "call table.explain(ExplainDetail.CHANGELOG_MODE)"
+      } else {
+        "run 'EXPLAIN CHANGELOG_MODE' on the SELECT part of the statement"
+      }
       "Can't generate a valid execution plan for the given query.\n\n" +
         "There is a changelog mismatch between two operators. One produces an upsert " +
         "changelog (UPDATE_AFTER without UPDATE_BEFORE). The other requires a retract " +
         "changelog (UPDATE_BEFORE and UPDATE_AFTER), for example a sink without a primary " +
         "key. In such cases, ensure that the sink is able to digest upserts where the " +
         "PRIMARY KEY serves as the upsert key, or make the input produce UPDATE_BEFORE.\n\n" +
-        "The conflict is at:\n" + conflict
+        "The conflict is at:\n" + conflict +
+        s"\n\nTo see which operators produce the upsert changelog, $investigate."
     } else {
       val plan = FlinkRelOptUtil.toString(rootWithModifyKindSet, withChangelogTraits = true)
       "Can't generate a valid execution plan for the given query because of a changelog mismatch: " +
@@ -155,6 +174,10 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
    * [[ModifyKindSetTrait]].
    */
   private class SatisfyModifyKindSetTraitVisitor {
+
+    private val tableSinkRequesterPrefix = "Table sink '"
+
+    private val dataStreamSinkRequesterPrefix = tableSinkRequesterPrefix + dataStreamSinkNamePrefix
 
     /**
      * Try to satisfy the required [[ModifyKindSetTrait]] from root.
@@ -183,7 +206,8 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
         requiredTrait: ModifyKindSetTrait,
         requester: String): StreamPhysicalRel = rel match {
       case sink: StreamPhysicalSink =>
-        val name = s"Table sink '${sink.contextResolvedTable.getIdentifier.asSummaryString()}'"
+        val name =
+          s"$tableSinkRequesterPrefix${sink.contextResolvedTable.getIdentifier.asSummaryString()}'"
         val queryModifyKindSet = deriveQueryDefaultChangelogMode(sink.getInput, name)
         val sinkRequiredTrait =
           ModifyKindSetTrait.fromChangelogMode(sink.tableSink.getChangelogMode(queryModifyKindSet))
@@ -607,10 +631,117 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
         val nodeString = tempNode.getRelDetailedDescription
         throw new TableException(
           s"$requestedOwner doesn't support consuming $diffString changes " +
-            s"which is produced by node $nodeString")
+            s"which is produced by node $nodeString" +
+            describeOrigins(tempNode, diff, diffString) +
+            sinkMismatchHint(requestedOwner, diff, diffString))
       }
       val newTraitSet = node.getTraitSet.plus(providedTrait)
       node.copy(newTraitSet, children).asInstanceOf[StreamPhysicalRel]
+    }
+
+    // The node that fails the check often only forwards the changes (e.g. a join over an
+    // aggregate), so walk down to the nodes that first produce the rejected changes.
+    // This only enriches an error that is about to be thrown, so it must never replace it.
+    private def describeOrigins(
+        failingNode: StreamPhysicalRel,
+        rejected: ModifyKindSet,
+        diffString: String): String = {
+      try {
+        val origins = mutable.LinkedHashSet[StreamPhysicalRel]()
+        // Walk once per rejected kind: different operators can add different kinds, e.g. an
+        // aggregate adds updates and a PTF or outer join on top of it adds deletes.
+        rejected.getContainedKinds.toList.sorted.foreach {
+          kind =>
+            // reused sub-plans make the plan a DAG; visit every node once
+            val visited =
+              Collections.newSetFromMap(new IdentityHashMap[RelNode, java.lang.Boolean]())
+            def collect(rel: StreamPhysicalRel): Unit = {
+              if (visited.add(rel)) {
+                val producingInputs = rel.getInputs
+                  .map(_.asInstanceOf[StreamPhysicalRel])
+                  .filter(getModifyKindSet(_).contains(kind))
+                if (producingInputs.isEmpty) {
+                  origins += rel
+                } else {
+                  producingInputs.foreach(collect)
+                }
+              }
+            }
+            collect(failingNode)
+        }
+        // operators that look the same (e.g. the same aggregate in many branches) share one line
+        val counts = mutable.LinkedHashMap[String, Int]()
+        origins.foreach {
+          origin =>
+            val description = describeOrigin(origin)
+            counts(description) = counts.getOrElse(description, 0) + 1
+        }
+        counts
+          .map {
+            case (description, 1) => s"\n  - $description"
+            case (description, count) => s"\n  - $description ($count operators)"
+          }
+          .mkString(s"\n\nThe $diffString changes originate from:", "", "")
+      } catch {
+        case NonFatal(_) => ""
+      }
+    }
+
+    private def describeOrigin(origin: StreamPhysicalRel): String = origin match {
+      case scan: StreamPhysicalTableSourceScan =>
+        val table = scan.getTable.unwrap(classOf[TableSourceTable]).contextResolvedTable
+        s"source table '${table.getIdentifier.asSummaryString()}' " +
+          "(an upsert or changelog table)"
+      case agg: StreamPhysicalGroupAggregateBase =>
+        s"${agg.getRelDetailedDescription} " +
+          "(an aggregation updates its result when new rows arrive)"
+      case join @ (_: StreamPhysicalJoin | _: StreamPhysicalMultiJoin) =>
+        s"${join.getRelDetailedDescription} " +
+          "(a regular join updates its result when an input changes, and an outer join " +
+          "also retracts rows padded with NULLs)"
+      case window: StreamPhysicalGroupWindowAggregateBase =>
+        s"${window.getRelDetailedDescription} " +
+          "(a window with early or late firing emits a result before the window is final " +
+          "and updates it later)"
+      case ptf: StreamPhysicalProcessTableFunction =>
+        s"${ptf.getRelDetailedDescription} " +
+          "(the process table function declares that it emits updates or deletes)"
+      case rank: StreamPhysicalRank =>
+        s"${rank.getRelDetailedDescription} " +
+          "(a Top-N or deduplication query updates its result when the ranking changes)"
+      case sort @ (_: StreamPhysicalSortLimit | _: StreamPhysicalSort) =>
+        s"${sort.getRelDetailedDescription} " +
+          "(ORDER BY on a stream updates earlier results when new rows arrive)"
+      case _ => origin.getRelDetailedDescription
+    }
+
+    // EXPLAIN on the failing statement fails with this same error, so point users to the
+    // statement that does show the changelog mode of every operator.
+    private def sinkMismatchHint(
+        requestedOwner: String,
+        rejected: ModifyKindSet,
+        diffString: String): String = {
+      if (requestedOwner.startsWith(dataStreamSinkRequesterPrefix)) {
+        s"\n\ntoDataStream() only accepts inserts, but this query also produces $diffString " +
+          "changes. To fix it, use tableEnv.toChangelogStream(table), which returns every " +
+          "insert, update and delete as a Row with its RowKind, or change the query so that it " +
+          s"only produces inserts. To see which operators produce the $diffString changes, call " +
+          "table.explain(ExplainDetail.CHANGELOG_MODE)."
+      } else if (requestedOwner.startsWith(tableSinkRequesterPrefix)) {
+        // a primary key only helps with updates; a sink that rejects deletes may already have one
+        val sinkExample = if (rejected.contains(ModifyKind.UPDATE)) {
+          " (for example, an upsert table with a PRIMARY KEY)"
+        } else {
+          ""
+        }
+        s"\n\nThis query produces $diffString changes, but the target table can't consume them. " +
+          s"To fix it, write to a table that can consume $diffString changes$sinkExample, or " +
+          "change the query so that it only produces inserts. To see which operators produce " +
+          s"the $diffString changes, run 'EXPLAIN CHANGELOG_MODE' on the SELECT part of the " +
+          "statement."
+      } else {
+        ""
+      }
     }
   }
 
