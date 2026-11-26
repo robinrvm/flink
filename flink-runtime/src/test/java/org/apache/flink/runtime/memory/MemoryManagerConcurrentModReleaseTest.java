@@ -25,9 +25,20 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.ConcurrentModificationException;
 import java.util.Iterator;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Validate memory release under concurrent modification exceptions. */
 class MemoryManagerConcurrentModReleaseTest {
+
+    /**
+     * release() retries until one pass over the list sees no concurrent modification. A modifier
+     * that never stops can therefore keep release() busy forever, so the modifier stops after
+     * release() has started this many passes.
+     */
+    private static final int MAX_RELEASE_ATTEMPTS_WHILE_MODIFYING = 10;
 
     @Test
     void testConcurrentModificationOnce() throws MemoryAllocationException {
@@ -57,16 +68,15 @@ class MemoryManagerConcurrentModReleaseTest {
                         .setPageSize(segmentSize)
                         .build();
 
-        ArrayList<MemorySegment> segs = new ArrayList<>(numSegments);
+        ReleaseAttemptCountingList<MemorySegment> segs =
+                new ReleaseAttemptCountingList<>(numSegments);
         memMan.allocatePages(this, segs, numSegments);
 
         // start a thread that performs concurrent modifications
-        Modifier mod = new Modifier(segs);
+        Modifier mod = new Modifier(segs, MAX_RELEASE_ATTEMPTS_WHILE_MODIFYING);
         Thread modRunner = new Thread(mod);
         modRunner.start();
-
-        // give the thread some time to start working
-        Thread.sleep(500);
+        mod.awaitFirstModification();
 
         try {
             memMan.release(segs);
@@ -75,32 +85,64 @@ class MemoryManagerConcurrentModReleaseTest {
         }
 
         modRunner.join();
+        assertThat(segs).isEmpty();
+        assertThat(memMan.verifyEmpty()).isTrue();
     }
 
     private static class Modifier implements Runnable {
 
-        private final ArrayList<MemorySegment> toModify;
+        private final ReleaseAttemptCountingList<MemorySegment> toModify;
+        private final int maxReleaseAttempts;
+        private final CountDownLatch firstModification = new CountDownLatch(1);
 
         private volatile boolean running = true;
 
-        private Modifier(ArrayList<MemorySegment> toModify) {
+        private Modifier(
+                ReleaseAttemptCountingList<MemorySegment> toModify, int maxReleaseAttempts) {
             this.toModify = toModify;
+            this.maxReleaseAttempts = maxReleaseAttempts;
         }
 
         public void cancel() {
             running = false;
         }
 
+        void awaitFirstModification() throws InterruptedException {
+            firstModification.await();
+        }
+
         @Override
         public void run() {
-            while (running) {
+            while (running && toModify.getIteratorCalls() < maxReleaseAttempts) {
                 try {
                     MemorySegment seg = toModify.remove(0);
                     toModify.add(seg);
                 } catch (IndexOutOfBoundsException e) {
                     // may happen, just retry
                 }
+                firstModification.countDown();
             }
+        }
+    }
+
+    private static class ReleaseAttemptCountingList<E> extends ArrayList<E> {
+
+        private static final long serialVersionUID = 1L;
+
+        private final AtomicInteger iteratorCalls = new AtomicInteger();
+
+        private ReleaseAttemptCountingList(int initialCapacity) {
+            super(initialCapacity);
+        }
+
+        int getIteratorCalls() {
+            return iteratorCalls.get();
+        }
+
+        @Override
+        public Iterator<E> iterator() {
+            iteratorCalls.incrementAndGet();
+            return super.iterator();
         }
     }
 
