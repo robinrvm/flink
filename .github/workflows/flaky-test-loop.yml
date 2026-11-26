@@ -41,6 +41,8 @@ on:
       # The branch that starts this workflow. If you change it, change the branches-ignore
       # entry in ci.yml too, so that the push doesn't also start the normal CI.
       - 'flaky-loop/**'
+  # to start it by hand (Actions tab or `gh workflow run`) if a push doesn't start it
+  workflow_dispatch:
 
 permissions: read-all
 
