@@ -58,8 +58,8 @@ env:
   BEFORE_REPO: ''
   BEFORE_COUNT: 100
   # The code with the fix, the same way.
-  # FLINK-35315: the fix commit
-  AFTER_COMMIT: 'd7616787d18c6a49db6b8c9451b374fadda863bb'
+  # FLINK-35315: candidate fix v2 (every modified pass sees the change, modifier stops before the last pass)
+  AFTER_COMMIT: '257fb1ac012b0f1411ec943410b5967215fd407d'
   AFTER_REPO: ''
   AFTER_COUNT: 100
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test'.
